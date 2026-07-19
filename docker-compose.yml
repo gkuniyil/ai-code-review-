@@ -1,0 +1,69 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: ai-code-reviewer-db
+    environment:
+      POSTGRES_USER: codereviewer
+      POSTGRES_PASSWORD: password123
+      POSTGRES_DB: codereviewer_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # Guardrail: Ensure Postgres is completely ready to accept connections
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U codereviewer -d codereviewer_db"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: ai-code-reviewer-redis
+    # Force Redis to run in the foreground explicitly with database save persistence
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    # Guardrail: Ensure Redis is completely ready before downstream services bind
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build: .
+    container_name: ai-code-reviewer-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app/backend
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://codereviewer:password123@db:5432/codereviewer_db
+      - REDIS_URL=redis://redis:6379/0
+    # Overrides local .env localhost configurations to route directly through the docker bridge
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    container_name: ai-code-reviewer-worker
+    command: celery -A backend.worker worker --loglevel=info
+    volumes:
+      - ./backend:/app/backend
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://codereviewer:password123@db:5432/codereviewer_db
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
