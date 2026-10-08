@@ -44,6 +44,8 @@ class PullRequest(Base):
     created_at = Column(DateTime, server_default=func.now())
     review_started_at = Column(DateTime, nullable = True)
     completed_at = Column(DateTime, nullable = True)
+    # set as soon as the github review is posted — a retry that sees this skips posting again
+    github_review_id = Column(Integer, nullable=True)
 
 
 class Review(Base):

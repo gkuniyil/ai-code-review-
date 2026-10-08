@@ -78,20 +78,63 @@ def test_get_latest_commit_sha_returns_head_sha(mock_client):
 
 
 @patch("backend.github_client.github_client")
-def test_post_review_comment_bubbles_up_errors_for_celery_retry(mock_client):
+def test_post_review_sends_summary_and_comments_in_one_call(mock_client):
+    mock_repo = MagicMock()
+    mock_pr = MagicMock()
+    mock_pr.create_review.return_value.id = 555
+    mock_repo.get_pull.return_value = mock_pr
+    mock_client.get_repo.return_value = mock_repo
+    comments = [{"path": "a.py", "line": 1, "body": "issue"}]
+
+    review_id = gc.post_review("octocat/hello-world", 42, "sha", "summary text", comments)
+
+    assert review_id == 555
+    mock_pr.create_review.assert_called_once_with(
+        commit=mock_repo.get_commit.return_value,
+        body="summary text",
+        event="COMMENT",
+        comments=comments,
+    )
+
+
+@patch("backend.github_client.github_client")
+def test_post_review_bubbles_up_errors_for_celery_retry(mock_client):
     """
-    tasks.py relies on these functions raising (not swallowing) errors so that
+    tasks.py relies on this raising (not swallowing) errors so that
     Celery's retry logic in review_pr() can catch them.
     """
     mock_client.get_repo.side_effect = GithubException(422, {"message": "bad"}, {})
 
-    with pytest.raises(Exception, match="failed to post comment"):
-        gc.post_review_comment("octocat/hello-world", 42, "a.py", 1, "comment", "sha")
+    with pytest.raises(Exception, match="failed to post review"):
+        gc.post_review("octocat/hello-world", 42, "sha", "summary", [])
 
 
-@patch("backend.github_client.github_client")
-def test_post_pr_summary_bubbles_up_errors_for_celery_retry(mock_client):
-    mock_client.get_repo.side_effect = GithubException(422, {"message": "bad"}, {})
+def test_commentable_lines_tracks_added_and_context_lines_per_file():
+    diff = (
+        "\n--- a.py ---\n"
+        "@@ -10,3 +10,4 @@ def foo():\n"
+        " unchanged\n"          # new line 10
+        "-removed\n"            # not in the new file
+        "+added one\n"          # new line 11
+        "+added two\n"          # new line 12
+        " unchanged\n"          # new line 13
+        "\n--- b.py ---\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+first\n"              # new line 1
+        "+second\n"             # new line 2
+        "\\ No newline at end of file"
+    )
 
-    with pytest.raises(Exception, match="failed to post summary"):
-        gc.post_pr_summary("octocat/hello-world", 42, "summary text")
+    assert gc.commentable_lines(diff) == {"a.py": {10, 11, 12, 13}, "b.py": {1, 2}}
+
+
+def test_commentable_lines_handles_multiple_hunks_in_one_file():
+    diff = (
+        "\n--- a.py ---\n"
+        "@@ -1,1 +1,1 @@\n"
+        "+top\n"                # new line 1
+        "@@ -50,1 +80,1 @@\n"
+        "+far below\n"          # new line 80
+    )
+
+    assert gc.commentable_lines(diff) == {"a.py": {1, 80}}

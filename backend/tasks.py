@@ -1,9 +1,8 @@
 from backend.worker import celery_app
 from backend.database import AsyncSessionLocal
 from backend.models import PullRequest, Review
-from backend.github_client import fetch_pr_diff, post_review_comment, post_pr_summary, get_latest_commit_sha
-from backend.ai_client import analyze_pr
-from sqlalchemy import select
+from backend.github_client import fetch_pr_diff, post_review, get_latest_commit_sha, commentable_lines
+from sqlalchemy import select, delete
 from backend.agents import review_graph
 from backend.analytics import QualityRuleEvaluator
 from datetime import datetime
@@ -25,6 +24,14 @@ async def _review_pr_async(task, pr_id: int):
             pr = result.scalar_one_or_none()
             if not pr:
                 raise Exception(f"PR {pr_id} not found in database")
+
+            # review was already posted by an earlier attempt (e.g. the worker crashed
+            # right after posting) — don't post it again, just finish marking it done
+            if pr.github_review_id:
+                pr.status = "completed"
+                pr.completed_at = pr.completed_at or datetime.utcnow()
+                await db.commit()
+                return
 
             # update status so dashboard shows current stage
             pr.status = "fetching_diff"
@@ -65,6 +72,9 @@ async def _review_pr_async(task, pr_id: int):
                 if QualityRuleEvaluator.verify_review_safety(f.comment, f.suggested_fix)
             ]
 
+            # clear findings saved by a previous failed attempt so a retry replaces them instead of duplicating
+            await db.execute(delete(Review).where(Review.pr_id == pr.id))
+
             # save all findings to PostgreSQL
             for finding in all_findings:
                 db.add(Review(
@@ -78,23 +88,31 @@ async def _review_pr_async(task, pr_id: int):
                 ))
             await db.commit()
 
-            # post inline comment on specific line for each finding
-            for finding in all_findings:
-                if finding.line_number:  # skip if no specific line
-                    post_review_comment(
-                        pr.repo_name,
-                        pr.github_pr_number,
-                        finding.file_path,
-                        finding.line_number,
-                        f"**{finding.agent_type.upper()} - {finding.severity.upper()}**\n{finding.comment}\n\n**Suggested Fix:** {finding.suggested_fix}",
-                        commit_sha
-                    )
+            # inline comments only for lines github will accept — the LLM can point at a file
+            # or line outside the diff, which would make github reject the whole review (422).
+            # findings without a valid line still appear in the summary below.
+            valid_lines = commentable_lines(diff)
+            inline_comments = [
+                {
+                    "path": finding.file_path,
+                    "line": finding.line_number,
+                    "body": f"**{finding.agent_type.upper()} - {finding.severity.upper()}**\n{finding.comment}\n\n**Suggested Fix:** {finding.suggested_fix}",
+                }
+                for finding in all_findings
+                if finding.line_number in valid_lines.get(finding.file_path, set())
+            ]
 
-            # build + post overall summary at bottom of PR
+            # build overall summary shown at the top of the review
             summary = f"🤖 AI Code Review Complete\n\nFound {len(all_findings)} issues:\n"
             for finding in all_findings:
                 summary += f"- **{finding.severity.upper()}** ({finding.agent_type}): {finding.comment}\n"
-            post_pr_summary(pr.repo_name, pr.github_pr_number, summary)
+
+            # post summary + inline comments as one review, then record it immediately
+            # so a retry after this point can't post a second copy
+            pr.github_review_id = post_review(
+                pr.repo_name, pr.github_pr_number, commit_sha, summary, inline_comments
+            )
+            await db.commit()
 
             # mark completed + record timestamp for metrics
             pr.status = "completed"
@@ -103,6 +121,8 @@ async def _review_pr_async(task, pr_id: int):
 
         except Exception as exc:
             if pr:  # only update if pr was successfully fetched
-                pr.status = "failed"
+                await db.rollback()  # discard half-finished work from this attempt (e.g. unsaved findings)
+                # "failed" only once retries are used up — before that the review is still in progress
+                pr.status = "retrying" if task.request.retries < task.max_retries else "failed"
                 await db.commit()
             raise task.retry(exc=exc, countdown=60)
