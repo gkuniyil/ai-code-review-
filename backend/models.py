@@ -10,7 +10,7 @@ Responsibilities:
     - Define relationship between them
 """
 
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, UniqueConstraint
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Index
 from sqlalchemy.sql import func
 
 from backend.database import Base
@@ -18,14 +18,19 @@ from backend.database import Base
 
 class PullRequest(Base):
     """
-    Stores information about a GitHub pull request.
+    Stores one review run of a GitHub pull request.
+
+    A PR gets a new row every time it's opened or receives new commits
+    ("synchronize"), so the same (repo_name, github_pr_number) can appear
+    many times — one row per webhook delivery. github_delivery_id is the
+    only thing that must be unique.
     """
 
     __tablename__ = "pull_requests"
     __table_args__ = (
-        # PR numbers are only unique within a repo (two different repos can
-        # both have a "PR #1") — github_pr_number alone must not be globally unique
-        UniqueConstraint("repo_name", "github_pr_number", name="uq_repo_pr_number"),
+        # non-unique index — makes "all review runs for this PR" lookups fast
+        # without blocking a second review of the same PR
+        Index("ix_repo_pr_number", "repo_name", "github_pr_number"),
     )
 
     id =Column(Integer, primary_key=True)

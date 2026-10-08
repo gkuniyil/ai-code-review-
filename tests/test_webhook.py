@@ -5,10 +5,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import UniqueConstraint
 from sqlalchemy.exc import IntegrityError
 
 from backend.config import settings
 from backend.database import get_db
+from backend.models import PullRequest
 from backend.webhook import router, verify_signature
 
 PR_PAYLOAD = {
@@ -132,6 +134,44 @@ def test_new_pr_is_saved_and_queued(mock_celery):
     assert resp.json() == {"status": "queued", "pr_id": 99}
     db_session.add.assert_called_once()
     mock_celery.send_task.assert_called_once_with("backend.tasks.review_pr", args=[99])
+
+
+@patch("backend.webhook.celery_app")
+def test_new_commits_on_existing_pr_are_queued(mock_celery):
+    """
+    A "synchronize" delivery (new commits pushed) has a new delivery id but the
+    same repo + PR number as an earlier review — it must be reviewed, not skipped.
+    """
+    client, db_session = _client_with_mock_db(existing_pr=None)
+
+    async def fake_refresh(pr):
+        pr.id = 100
+
+    db_session.refresh.side_effect = fake_refresh
+
+    payload = {**PR_PAYLOAD, "action": "synchronize"}
+    body = json.dumps(payload).encode()
+    resp = client.post("/api/v1/webhook", content=body, headers=headers_for(body, delivery_id="d2"))
+
+    assert resp.json() == {"status": "queued", "pr_id": 100}
+    mock_celery.send_task.assert_called_once_with("backend.tasks.review_pr", args=[100])
+
+
+def test_schema_allows_multiple_review_runs_per_pr():
+    """
+    Regression test: a unique constraint on (repo_name, github_pr_number) made the
+    second webhook for a PR fail with IntegrityError, which the endpoint reported
+    as "duplicate" — so new commits were silently never reviewed.
+    Only github_delivery_id should be unique.
+    """
+    table = PullRequest.__table__
+    unique_column_sets = [
+        set(c.columns.keys()) for c in table.constraints if isinstance(c, UniqueConstraint)
+    ]
+    unique_column_sets += [{c.name} for c in table.columns if c.unique]
+
+    assert {"github_delivery_id"} in unique_column_sets
+    assert not any("github_pr_number" in cols for cols in unique_column_sets)
 
 
 @patch("backend.webhook.celery_app")
