@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     github_webhook_secret: str
     github_token: str
     groq_api_key: str
+    sql_echo: bool = False  # set SQL_ECHO=true to log every SQL query while debugging
 
     class Config:
         env_file = ".env"

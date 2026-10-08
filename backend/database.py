@@ -8,7 +8,7 @@ from backend.config import settings
 # max_overflow=20 — 20 extra connections allowed during traffic spikes
 engine = create_async_engine(
     settings.database_url,
-    echo=True,
+    echo=settings.sql_echo,  # off by default — logging every query is noisy and can leak data into logs
     pool_size=10,
     max_overflow=20
 )
