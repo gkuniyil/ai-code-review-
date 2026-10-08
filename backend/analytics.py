@@ -19,7 +19,7 @@ class SystemPerformanceSnapshot(BaseModel):
 def track_transaction(tokens: int, duration: float):
     """Updates global telemetry buffers atomically."""
     SYSTEM_METRICS["total_reviews_processed"] += 1
-    SYSTEM_METRICS["total_tokens_consumed"] += 1
+    SYSTEM_METRICS["total_tokens_consumed"] += tokens
     SYSTEM_METRICS["accumulated_latency_seconds"] += duration
 
 def get_performance_report() -> SystemPerformanceSnapshot:
