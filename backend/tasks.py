@@ -5,6 +5,7 @@ from backend.github_client import fetch_pr_diff, post_review_comment, post_pr_su
 from backend.ai_client import analyze_pr
 from sqlalchemy import select
 from backend.agents import review_graph
+from backend.analytics import QualityRuleEvaluator
 from datetime import datetime
 import asyncio
 
@@ -56,6 +57,13 @@ async def _review_pr_async(task, pr_id: int):
                 "all_findings": []
             })
             all_findings = result["all_findings"]
+
+            # drop findings that fail basic safety checks (blank/hallucinated comments,
+            # malformed markdown, unprofessional phrasing) before they reach GitHub or the DB
+            all_findings = [
+                f for f in all_findings
+                if QualityRuleEvaluator.verify_review_safety(f.comment, f.suggested_fix)
+            ]
 
             # save all findings to PostgreSQL
             for finding in all_findings:

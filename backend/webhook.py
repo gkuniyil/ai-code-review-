@@ -3,6 +3,7 @@ import hashlib                 # provides sha256 algorithm
 from fastapi import APIRouter, Request, HTTPException, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select  # used to query postgresql
+from sqlalchemy.exc import IntegrityError  # raised if two concurrent requests race past the duplicate check
 from backend.database import get_db      # yields db session per request
 from backend.models import PullRequest   # the table we're inserting into
 from backend.config import settings      # access to env variables
@@ -38,7 +39,6 @@ def verify_signature(payload: bytes, signature: str) -> bool:
 
 @router.post("/webhook")
 @limiter.limit("100/minute")  # max 100 webhooks per minute per IP
-@router.post("/webhook")
 async def github_webhook(
     request: Request,                    # raw http request object
     db: AsyncSession = Depends(get_db)   # db session injected automatically
@@ -102,7 +102,13 @@ async def github_webhook(
         status="pending"
     )
     db.add(pr)           # stage the insert — not written yet
-    await db.commit()    # actually write to postgresql
+    try:
+        await db.commit()    # actually write to postgresql
+    except IntegrityError:
+        # two deliveries of the same webhook raced past the check above —
+        # the unique constraint on github_delivery_id is the real guard, this is just the graceful path
+        await db.rollback()
+        return {"status": "duplicate"}
     await db.refresh(pr) # fetch auto-generated id back from postgresql
 
     # drop job into redis queue instantly

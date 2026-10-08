@@ -1,13 +1,17 @@
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from backend.database import engine, Base
 from backend.webhook import router as webhook_router
 from backend.middleware import limiter
-from sqlalchemy import func, text, select 
+from backend.config import settings
+from sqlalchemy import func, text, select
 from backend.database import AsyncSessionLocal
 from backend.models import PullRequest, Review
+from backend.evals import score_review_quality
+import redis.asyncio as redis_async
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -30,7 +34,33 @@ app.include_router(webhook_router, prefix="/api/v1")
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "ai-code-reviewer"}
+    """
+    checks that the app can actually reach its dependencies —
+    a static 200 tells you the process is alive, not that it's usable.
+    """
+    db_ok = True
+    try:
+        async with AsyncSessionLocal() as db:
+            await db.execute(text("SELECT 1"))
+    except Exception:
+        db_ok = False
+
+    redis_ok = True
+    try:
+        redis_client = redis_async.from_url(settings.redis_url)
+        await redis_client.ping()
+        await redis_client.close()
+    except Exception:
+        redis_ok = False
+
+    healthy = db_ok and redis_ok
+    body = {
+        "status": "ok" if healthy else "degraded",
+        "service": "ai-code-reviewer",
+        "database": "ok" if db_ok else "unreachable",
+        "redis": "ok" if redis_ok else "unreachable",
+    }
+    return JSONResponse(content=body, status_code=200 if healthy else 503)
 
 @app.get("/metrics")
 async def get_metrics():
@@ -81,3 +111,11 @@ async def get_metrics():
         "findings_by_severity": severity,
         "findings_by_agent": agents
     }
+
+@app.get("/reviews/{pr_id}/score")
+async def get_review_score(pr_id: int):
+    """
+    scores how complete/actionable a PR's review findings are.
+    see backend/evals.py for the scoring rubric.
+    """
+    return await score_review_quality(pr_id)

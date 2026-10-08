@@ -1,0 +1,14 @@
+.env
+.env.*
+.git
+.gitignore
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+dist/
+.DS_Store
+postgres_data/
+frontend/
+tests/
+README.md

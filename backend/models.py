@@ -10,7 +10,7 @@ Responsibilities:
     - Define relationship between them
 """
 
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, UniqueConstraint
 from sqlalchemy.sql import func
 
 from backend.database import Base
@@ -22,10 +22,15 @@ class PullRequest(Base):
     """
 
     __tablename__ = "pull_requests"
+    __table_args__ = (
+        # PR numbers are only unique within a repo (two different repos can
+        # both have a "PR #1") — github_pr_number alone must not be globally unique
+        UniqueConstraint("repo_name", "github_pr_number", name="uq_repo_pr_number"),
+    )
 
     id =Column(Integer, primary_key=True)
     github_delivery_id = Column(String(255), nullable=False, unique=True)
-    github_pr_number = Column(Integer, nullable=False, unique=True)
+    github_pr_number = Column(Integer, nullable=False)
     repo_name = Column(String(500), nullable=False)
     title = Column(String(500), nullable=False)
     author = Column(String(255), nullable=False)
