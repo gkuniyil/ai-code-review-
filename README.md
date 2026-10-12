@@ -38,9 +38,44 @@ Once running, you can open your browser and go to http://localhost:8000/docs to 
      * Postgres is the source of truth for embeddings; the FAISS index is rebuilt per review from those rows, so memory survives restarts and is shared by every worker process. Exact search (`IndexFlatIP`) over the latest 2,000 findings per repo is fast at this scale — millions of vectors would call for an approximate index or pgvector.
      * Memory is best-effort: if the lookup or the embedding model fails, the review still runs without hints.
 4. `GET /metrics` and `GET /reviews/{pr_id}/score` expose aggregate stats and a per-PR review quality score for the dashboard.
+5. An **MCP server** (`backend/mcp_tools.py`) lets an AI assistant such as Claude Code or Claude Desktop query the review history.
+
+## MCP server
+Read-only tools over the review history:
+
+| Tool | What it returns |
+|---|---|
+| `list_reviews(repo?, limit?)` | Recent review runs with status and finding counts |
+| `get_review(pr_id)` | One review run and all its findings |
+| `list_findings(repo?, severity?, agent_type?, limit?)` | Findings across runs, filtered |
+| `get_review_stats(repo?)` | Counts by severity and agent |
+| `find_similar_past_issues(repo, code, k?)` | Review-memory search: past findings whose code resembles `code` |
+
+Design notes:
+* **Read-only by design.** No tool can trigger a review, post to GitHub, or write to the database, so a confused or prompt-injected assistant can't cause damage through it. Every tool is annotated `read_only_hint=True`.
+* **Separate process and dependency set.** The MCP SDK needs newer Starlette/Pydantic than the pinned FastAPI version, so it has its own `requirements-mcp.txt` and runs as its own process. It only needs to reach Postgres.
+* Responses are capped (100 rows, 20 similarity hits) to stay within an assistant's context window.
+
+Run it against the Docker Compose database. The connection string uses `localhost` because the server runs on your machine, not inside the Docker network:
+```bash
+python3.11 -m venv .venv-mcp && .venv-mcp/bin/pip install -r requirements-mcp.txt
+```
+Then register it with Claude Code by adding a `.mcp.json` in the repo root:
+```json
+{
+  "mcpServers": {
+    "ai-code-reviewer": {
+      "command": ".venv-mcp/bin/python",
+      "args": ["-m", "backend.mcp_tools"],
+      "env": { "DATABASE_URL": "postgresql+asyncpg://codereviewer:password123@localhost:5432/codereviewer_db" }
+    }
+  }
+}
+```
+The other settings (`GITHUB_TOKEN`, etc.) are still read from `.env` because `backend/config.py` requires them, even though the MCP server never uses them.
 
 ## Known limitations
-* `backend/mcp_tools.py` is an empty placeholder — no MCP integration exists yet.
+* The MCP server loads the full app `Settings`, so it needs the GitHub/Groq secrets in `.env` even though it never uses them. Giving it its own minimal settings would follow least privilege more closely.
 * Past findings recalled from memory are LLM-generated text derived from earlier PRs, so they're framed in the prompt as hints, not instructions — but like the diff itself they're untrusted input and a possible prompt-injection path.
 * No database migrations — tables are created with `create_all()`, which doesn't alter existing tables. A database created before the latest schema changes needs:
   ```sql
@@ -53,4 +88,4 @@ Once running, you can open your browser and go to http://localhost:8000/docs to 
 * If Redis is unreachable when a webhook arrives, the `PullRequest` row is saved but the job is never queued, so it stays `pending`. A transactional outbox (or a periodic sweep of stale `pending` rows) would fix this.
 * Each Celery task runs its async code with `asyncio.run()`, which creates a new event loop per task while the SQLAlchemy engine's connection pool is shared at module level. Pooled asyncpg connections are tied to the loop that created them, so this can fail on a worker's later tasks; disposing the engine per task (or using `NullPool` in the worker) would fix it.
 * `GET /metrics` and `GET /reviews/{pr_id}/score` are unauthenticated.
-* Tests (46) cover webhook signature verification/dedup, the LangGraph agent fan-out/fan-in, GitHub API calls and diff-line parsing, the review task's retry/idempotency behavior, review memory (retrieval, thresholds, graceful failure — using a fake embedding model), and the safety filter — they do not include a live integration test against real Postgres/Redis/GitHub.
+* Tests (57) cover webhook signature verification/dedup, the LangGraph agent fan-out/fan-in, GitHub API calls and diff-line parsing, the review task's retry/idempotency behavior, review memory (retrieval, thresholds, graceful failure — using a fake embedding model), the MCP server's tools and read-only annotations, its queries (against in-memory SQLite), and the safety filter. CI runs the MCP tests in a separate job with `requirements-mcp.txt` — they do not include a live integration test against real Postgres/Redis/GitHub.

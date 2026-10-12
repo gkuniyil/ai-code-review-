@@ -16,6 +16,7 @@ import numpy as np
 
 EMBEDDING_DIM = 384      # output size of all-MiniLM-L6-v2
 MIN_SIMILARITY = 0.35    # cosine similarity cutoff — measured: related code ~0.4-0.6, unrelated < 0.2
+MEMORY_SEARCH_LIMIT = 2000  # most recent past findings searched per repo — bounds memory and search time
 
 _model = None
 

@@ -1,3 +1,4 @@
+from pathlib import Path
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
@@ -15,7 +16,9 @@ class Settings(BaseSettings):
     sql_echo: bool = False  # set SQL_ECHO=true to log every SQL query while debugging
 
     class Config:
-        env_file = ".env"
+        # absolute path so .env is found no matter which directory the process starts in
+        # (e.g. the MCP server, which Claude launches from its own working directory)
+        env_file = Path(__file__).resolve().parent.parent / ".env"
 
 # Single instance imported everywhere — never instantiate Settings() twice
 settings = Settings()

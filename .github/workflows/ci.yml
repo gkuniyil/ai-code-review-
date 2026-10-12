@@ -29,3 +29,27 @@ jobs:
           GITHUB_WEBHOOK_SECRET: testsecret
           GITHUB_TOKEN: testtoken
           GROQ_API_KEY: testkey
+
+  # the MCP server has its own dependency set (requirements-mcp.txt) — test it in that environment
+  mcp-server:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install MCP server dependencies
+        run: pip install -r requirements-mcp.txt
+
+      - name: Run MCP server tests
+        run: pytest tests/test_mcp_server.py tests/test_review_queries.py tests/test_embeddings.py -v
+        env:
+          DATABASE_URL: postgresql+asyncpg://test:test@localhost/test
+          REDIS_URL: redis://localhost:6379/0
+          GITHUB_WEBHOOK_SECRET: testsecret
+          GITHUB_TOKEN: testtoken
+          GROQ_API_KEY: testkey

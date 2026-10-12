@@ -1,0 +1,20 @@
+# environment for the MCP server only (python -m backend.mcp_tools).
+# separate from requirements.txt because the MCP SDK needs newer
+# starlette/pydantic/uvicorn than the pinned FastAPI version allows.
+# the server only reads Postgres, so it needs none of FastAPI, Celery, Groq or PyGithub.
+mcp==2.3.0
+sqlalchemy==2.0.30
+greenlet==3.1.1        # required by SQLAlchemy's async mode; not auto-installed on Apple Silicon
+asyncpg==0.29.0
+pydantic-settings==2.3.0
+
+# review memory search (backend/embeddings.py)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.1
+sentence-transformers==5.1.2
+faiss-cpu==1.12.0
+numpy==2.4.6
+
+pytest==8.2.2
+pytest-asyncio==0.23.7
+aiosqlite==0.20.0

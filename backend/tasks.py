@@ -2,7 +2,7 @@ from backend.worker import celery_app
 from backend.database import AsyncSessionLocal
 from backend.models import PullRequest, Review
 from backend.github_client import fetch_pr_diff, post_review, get_latest_commit_sha, commentable_lines, code_snippet, diff_chunks
-from backend.embeddings import embed, find_similar, to_bytes, from_bytes
+from backend.embeddings import MEMORY_SEARCH_LIMIT, embed, find_similar, to_bytes, from_bytes
 from sqlalchemy import select, delete
 from backend.agents import review_graph
 from backend.analytics import QualityRuleEvaluator
@@ -11,9 +11,6 @@ import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
-
-# cap on how many past findings are loaded per review — bounds memory and search time
-MEMORY_SEARCH_LIMIT = 2000
 
 
 async def recall_similar_findings(db, pr, diff: str) -> list[dict]:

@@ -12,3 +12,5 @@ postgres_data/
 frontend/
 tests/
 README.md
+.venv/
+.venv-mcp/

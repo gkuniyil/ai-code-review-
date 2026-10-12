@@ -6,3 +6,5 @@ postgres_data/
 .pytest_cache/
 *.egg-info/
 dist/
+.venv/
+.venv-mcp/
