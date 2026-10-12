@@ -6,7 +6,7 @@ A full-stack platform that automatically reviews GitHub pull requests using AI t
 * Backend: FastAPI (Python)
 * Database: PostgreSQL (with SQLAlchemy, async)
 * Queue & Cache: Celery & Redis (for handling heavy background tasks)
-* AI Engine: Groq (`llama-3.3-70b-versatile`), orchestrated as 4 parallel review agents via LangGraph
+* AI Engine: 4 parallel review agents orchestrated via LangGraph, on a switchable provider — Groq (`llama-3.3-70b-versatile`, default) or Anthropic Claude (`claude-opus-5-5`)
 * Review memory (RAG): Hugging Face `all-MiniLM-L6-v2` embeddings + FAISS similarity search
 
 ## Quick Setup
@@ -19,6 +19,12 @@ REDIS_URL=redis://redis:6379/0
 GITHUB_WEBHOOK_SECRET=your_webhook_secret
 GITHUB_TOKEN=your_github_token
 GROQ_API_KEY=your_groq_api_key
+
+To review with Claude instead of Groq:
+
+LLM_PROVIDER=anthropic
+ANTHROPIC_API_KEY=your_anthropic_api_key
+# optional: REVIEW_CLAUDE_MODEL (default claude-opus-5-5), REVIEW_CLAUDE_EFFORT (low|medium|high|xhigh|max, default high)
 
 ### 2. Run with Docker
 Start the entire platform (backend, database, and background workers) with one command:
@@ -33,6 +39,7 @@ Once running, you can open your browser and go to http://localhost:8000/docs to 
 3. A Celery worker fetches the PR diff via the GitHub API, runs it through 4 parallel Groq-backed review agents (security, bug, quality, optimization) orchestrated by a LangGraph graph, filters findings through a basic safety check (`QualityRuleEvaluator`), saves them to Postgres, and posts them back to the PR as **one GitHub review**: a summary plus inline comments. Findings whose line number isn't part of the diff (which GitHub would reject) appear in the summary only.
    * Every push to a PR is reviewed: `opened` and `synchronize` deliveries each create their own review run, deduplicated by GitHub's delivery id.
    * Retries are safe: findings from a failed attempt are replaced rather than duplicated, and once the review is posted its id is stored (`github_review_id`), so a retry never posts it twice.
+   * **LLM provider is switchable** (`LLM_PROVIDER`): the rest of the app only calls `analyze_pr()` in `backend/ai_client.py`. On Claude, the response is constrained to the `PRReview` Pydantic schema with structured outputs (`messages.parse(output_format=PRReview)`), so it can't come back as invalid JSON the way free-form Groq output can. The system prompt and diff are identical for all four agents and come first in the request, marked for prompt caching, so retries (and later agents, once the cache is written) reuse them; agent-specific instructions follow. Policy refusals fall back to another model server-side (`fallbacks: "default"`), and a remaining refusal raises so Celery retries.
    * **Review memory (RAG):** each saved finding also stores the code it pointed at and an embedding of that code (`backend/embeddings.py`). Before the agents run, the new diff is split into small chunks and searched with FAISS against past findings **from the same repo**; matches above a similarity cutoff are added to the matching agent's prompt as hints (the security agent only sees past security findings, etc.).
      * Code is matched against *code*, not against finding text — in testing, code-vs-comment similarity was too noisy to rank correctly, while code-vs-code reliably surfaced related findings (~0.4–0.6) and ignored unrelated code (< 0.2).
      * Postgres is the source of truth for embeddings; the FAISS index is rebuilt per review from those rows, so memory survives restarts and is shared by every worker process. Exact search (`IndexFlatIP`) over the latest 2,000 findings per repo is fast at this scale — millions of vectors would call for an approximate index or pgvector.
@@ -88,4 +95,5 @@ The other settings (`GITHUB_TOKEN`, etc.) are still read from `.env` because `ba
 * If Redis is unreachable when a webhook arrives, the `PullRequest` row is saved but the job is never queued, so it stays `pending`. A transactional outbox (or a periodic sweep of stale `pending` rows) would fix this.
 * Each Celery task runs its async code with `asyncio.run()`, which creates a new event loop per task while the SQLAlchemy engine's connection pool is shared at module level. Pooled asyncpg connections are tied to the loop that created them, so this can fail on a worker's later tasks; disposing the engine per task (or using `NullPool` in the worker) would fix it.
 * `GET /metrics` and `GET /reviews/{pr_id}/score` are unauthenticated.
-* Tests (57) cover webhook signature verification/dedup, the LangGraph agent fan-out/fan-in, GitHub API calls and diff-line parsing, the review task's retry/idempotency behavior, review memory (retrieval, thresholds, graceful failure — using a fake embedding model), the MCP server's tools and read-only annotations, its queries (against in-memory SQLite), and the safety filter. CI runs the MCP tests in a separate job with `requirements-mcp.txt` — they do not include a live integration test against real Postgres/Redis/GitHub.
+* The four agents call the LLM at the same moment, so on Claude they usually all miss the prompt cache on the first attempt (the cache entry is written only once a response starts). Caching mainly pays off on retries; running one agent first to warm the cache would trade latency for cost.
+* Tests (67) cover the Groq and Claude providers (request shape, refusals, provider-specific config), webhook signature verification/dedup, the LangGraph agent fan-out/fan-in, GitHub API calls and diff-line parsing, the review task's retry/idempotency behavior, review memory (retrieval, thresholds, graceful failure — using a fake embedding model), the MCP server's tools and read-only annotations, its queries (against in-memory SQLite), and the safety filter. CI runs the MCP tests in a separate job with `requirements-mcp.txt` — they do not include a live integration test against real Postgres/Redis/GitHub.
