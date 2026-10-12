@@ -18,6 +18,7 @@ def _finding(agent_type: str) -> ReviewFinding:
 def _initial_state(diff: str = "some diff") -> dict:
     return {
         "diff": diff,
+        "similar_findings": [],
         "security_findings": [],
         "bug_findings": [],
         "quality_findings": [],
@@ -32,7 +33,7 @@ def test_graph_fans_out_to_all_four_agents(mock_analyze):
     All four agent nodes should run off the same diff, each with its own
     agent_type, and the synthesizer should wait for all of them before merging.
     """
-    mock_analyze.side_effect = lambda diff, agent_type: PRReview(
+    mock_analyze.side_effect = lambda diff, agent_type, past_findings="": PRReview(
         findings=[_finding(agent_type)], summary="ok"
     )
 
@@ -46,7 +47,7 @@ def test_graph_fans_out_to_all_four_agents(mock_analyze):
 
 @patch("backend.agents.analyze_pr")
 def test_synthesize_merges_findings_from_every_agent(mock_analyze):
-    mock_analyze.side_effect = lambda diff, agent_type: PRReview(
+    mock_analyze.side_effect = lambda diff, agent_type, past_findings="": PRReview(
         findings=[_finding(agent_type)], summary="ok"
     )
 
@@ -71,3 +72,21 @@ def test_graph_handles_clean_diff_with_no_findings(mock_analyze):
     result = graph.invoke(_initial_state())
 
     assert result["all_findings"] == []
+
+
+@patch("backend.agents.analyze_pr")
+def test_each_agent_only_gets_past_findings_from_its_own_specialty(mock_analyze):
+    mock_analyze.return_value = PRReview(findings=[], summary="ok")
+    state = _initial_state()
+    state["similar_findings"] = [
+        {"agent_type": "security", "severity": "high", "file_path": "db.py", "comment": "SQL injection"},
+        {"agent_type": "quality", "severity": "low", "file_path": "db.py", "comment": "unclear name"},
+    ]
+
+    build_review_graph().invoke(state)
+
+    hints = {call.args[1]: call.args[2] for call in mock_analyze.call_args_list}
+    assert hints["security"] == "- [high] db.py: SQL injection"
+    assert hints["quality"] == "- [low] db.py: unclear name"
+    assert hints["bug"] == ""
+    assert hints["optimization"] == ""

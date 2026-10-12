@@ -16,9 +16,11 @@ langgraph==0.1.9
 slowapi==0.1.9
 python-json-logger==2.0.7
 
-# not wired into the app today — only needed if backend/embeddings.py
-# (local embeddings + FAISS similarity search) gets integrated; see README
-#--extra-index-url https://download.pytorch.org/whl/cpu
-#torch==2.13.0
-#sentence-transformers==3.0.1
-#faiss-cpu==1.8.0
+# review memory (backend/embeddings.py): Hugging Face embeddings + FAISS search.
+# CPU-only torch keeps the image ~1.5GB smaller than the default CUDA build.
+# faiss-cpu >= 1.9 is needed for numpy 2 compatibility.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.1
+sentence-transformers==5.1.2
+faiss-cpu==1.12.0
+numpy==2.4.6

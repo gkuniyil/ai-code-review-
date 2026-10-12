@@ -1,70 +1,82 @@
 # backend/embeddings.py
+"""
+review memory — retrieval over past findings (RAG).
+
+each saved finding stores the code it pointed at plus an embedding of that code.
+before a new review, chunks of the new diff are embedded and searched against
+past findings from the same repo with FAISS; close matches are handed to the
+agents as hints ("similar code here was flagged for SQL injection before").
+
+postgres is the source of truth for embeddings — the FAISS index is rebuilt
+per review from those rows, so nothing is lost on restart and every worker
+process sees the same memory.
+"""
 import faiss
 import numpy as np
-from sentence_transformers import SentenceTransformer
 
-# initialize the Local Transformer Engine
-model = SentenceTransformer("all-MiniLM-L6-v2")
+EMBEDDING_DIM = 384      # output size of all-MiniLM-L6-v2
+MIN_SIMILARITY = 0.35    # cosine similarity cutoff — measured: related code ~0.4-0.6, unrelated < 0.2
 
-# iinitialize the Volatile Math Index
-# IndexFlatL2 executes a brute force exact search by measuring Euclidean Distance (L2)  between the incoming query vector and all recorded vectors in memory.
-index = faiss.IndexFlatL2(384)
-
-# Serves as the index bridge: array position X maps directly to index position X in FAISS.
-review_store = []
+_model = None
 
 
-def generate_embedding(text: str) -> np.ndarray:
+def _get_model():
     """
-    Transforms structural text strings into a normalized 384-dimensional vector array.
+    loads the Hugging Face sentence-transformer once per process, on first use.
+    importing lazily keeps torch out of processes that never embed (the web server, tests).
     """
-    # model.encode expects an iterable list, we extract index 0 to pull the raw array
-    return model.encode([text])[0]
+    global _model
+    if _model is None:
+        from sentence_transformers import SentenceTransformer
+        _model = SentenceTransformer("all-MiniLM-L6-v2")
+    return _model
 
 
-def index_review(review_id: int, comment: str, suggested_fix: str):
+def embed(texts: list[str]) -> np.ndarray:
     """
-    Appends a new review vector to the active FAISS index frame.
-    Invoked immediately following database synchronization.
+    turns texts into a (len(texts), 384) float32 matrix of unit-length vectors.
+    unit length means inner product == cosine similarity, which IndexFlatIP computes.
     """
-    # Create an integrated context string so fixes and bugs are bound conceptually
-    text = f"{comment} {suggested_fix or ''}"
-    embedding = generate_embedding(text)
-    
-    # FAISS expects a 2D float32 matrix row array: shape (1, 384)
-    vector_matrix = np.array([embedding]).astype('float32')
-    index.add(vector_matrix)
-    
-    # Append corresponding contextual metadata at the exact same position index
-    review_store.append({
-        "review_id": review_id,
-        "comment": comment,
-        "suggested_fix": suggested_fix
-    })
+    vectors = _get_model().encode(texts, normalize_embeddings=True)
+    return np.asarray(vectors, dtype="float32")
 
 
-def search_similar(code_snippet: str, k: int = 3) -> list:
+def to_bytes(vector: np.ndarray) -> bytes:
+    """serializes one embedding for the reviews.embedding column"""
+    return np.asarray(vector, dtype="float32").tobytes()
+
+
+def from_bytes(data: bytes) -> np.ndarray:
+    """inverse of to_bytes"""
+    return np.frombuffer(data, dtype="float32")
+
+
+def find_similar(query_texts: list[str], past: list[dict], k: int = 5) -> list[dict]:
     """
-    Scans the live coordinate grid to find the 'k' nearest vector neighbors.
+    returns up to k past findings whose code is most similar to any query text.
+
+    past: dicts with an "embedding" (np.ndarray) plus any metadata to return.
+    each result is the past dict (minus "embedding") plus its best "similarity".
     """
-    # Guard routine to handle blank states before any reviews have occurred
-    if index.ntotal == 0:
+    if not query_texts or not past:
         return []
 
-    # Vectorize incoming query text
-    query_vector = np.array([generate_embedding(code_snippet)]).astype('float32')
+    # IndexFlatIP = exact (brute-force) inner-product search. fine for thousands of
+    # vectors; millions would need an approximate index (IVF/HNSW) or pgvector
+    index = faiss.IndexFlatIP(EMBEDDING_DIM)
+    index.add(np.stack([p["embedding"] for p in past]).astype("float32"))
 
-    # Query the memory frame
-    # distances: proximity variations (lower float values mean closer conceptual match)
-    # indices: array of matrix row position markers that matched the geometry
-    distances, indices = index.search(query_vector, k)
+    scores, ids = index.search(embed(query_texts), min(k, len(past)))
 
-    results = []
-    for i, idx in enumerate(indices[0]):
-        # FAISS returns -1 for indices if it doesn't find enough points to satisfy k
-        if idx != -1 and idx < len(review_store):
-            results.append({
-                "review": review_store[idx],
-                "distance": float(distances[0][i])
-            })
-    return results
+    # a past finding can match several chunks — keep its best score
+    best: dict[int, float] = {}
+    for row_scores, row_ids in zip(scores, ids):
+        for score, idx in zip(row_scores, row_ids):
+            if idx != -1 and score >= MIN_SIMILARITY:
+                best[int(idx)] = max(best.get(int(idx), 0.0), float(score))  # plain python types, so results are JSON-safe
+
+    ranked = sorted(best.items(), key=lambda item: item[1], reverse=True)[:k]
+    return [
+        {**{key: v for key, v in past[idx].items() if key != "embedding"}, "similarity": round(score, 3)}
+        for idx, score in ranked
+    ]

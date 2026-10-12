@@ -128,6 +128,41 @@ def test_commentable_lines_tracks_added_and_context_lines_per_file():
     assert gc.commentable_lines(diff) == {"a.py": {10, 11, 12, 13}, "b.py": {1, 2}}
 
 
+SNIPPET_DIFF = (
+    "\n--- db.py ---\n"
+    "@@ -0,0 +1,6 @@\n"
+    "+import db\n"
+    "+def find(name):\n"
+    "+    q = 'SELECT * FROM users WHERE name=' + name\n"
+    "+    return db.run(q)\n"
+    "+\n"
+    "+print('done')\n"
+)
+
+
+def test_code_snippet_returns_flagged_line_with_context():
+    assert gc.code_snippet(SNIPPET_DIFF, "db.py", 3, context=1) == (
+        "def find(name):\n"
+        "    q = 'SELECT * FROM users WHERE name=' + name\n"
+        "    return db.run(q)"
+    )
+
+
+def test_code_snippet_is_none_for_lines_outside_the_diff():
+    assert gc.code_snippet(SNIPPET_DIFF, "db.py", 500) is None
+    assert gc.code_snippet(SNIPPET_DIFF, "other.py", 1) is None
+    assert gc.code_snippet(SNIPPET_DIFF, "db.py", None) is None
+
+
+def test_diff_chunks_splits_new_code_into_small_pieces():
+    chunks = gc.diff_chunks(SNIPPET_DIFF, chunk_size=4)
+
+    assert chunks == [
+        "import db\ndef find(name):\n    q = 'SELECT * FROM users WHERE name=' + name\n    return db.run(q)",
+        "\nprint('done')",
+    ]
+
+
 def test_commentable_lines_handles_multiple_hunks_in_one_file():
     diff = (
         "\n--- a.py ---\n"

@@ -24,21 +24,20 @@ def fetch_pr_diff(repo_name: str, pr_number: int) -> str:
     except GithubException as e:
         raise Exception(f"github api error: {e.status} {e.data}")
 
-def commentable_lines(diff: str) -> dict[str, set[int]]:
+def new_file_lines(diff: str) -> dict[str, dict[int, str]]:
     """
-    maps each file in the diff to the new-file line numbers github will accept comments on.
-    github rejects (422) inline comments on lines outside the diff hunks — and the LLM
-    sometimes invents line numbers — so findings are checked against this before posting.
-    expects the "--- filename ---" format built by fetch_pr_diff.
+    maps each file in the diff to {new-file line number: code on that line}, for every
+    line that appears in the diff hunks. expects the "--- filename ---" format built
+    by fetch_pr_diff.
     """
-    lines_by_file: dict[str, set[int]] = {}
+    lines_by_file: dict[str, dict[int, str]] = {}
     current_file = None
     new_line = 0
 
     for line in diff.splitlines():
         if line.startswith("--- ") and line.endswith(" ---"):
             current_file = line[4:-4]                        # strip "--- " and " ---"
-            lines_by_file[current_file] = set()
+            lines_by_file[current_file] = {}
         elif current_file is None:
             continue
         elif line.startswith("@@"):
@@ -46,12 +45,49 @@ def commentable_lines(diff: str) -> dict[str, set[int]]:
             new_start = line.split("+", 1)[1].split(" ", 1)[0].split(",")[0]
             new_line = int(new_start)
         elif line.startswith("+") or line.startswith(" "):
-            lines_by_file[current_file].add(new_line)        # added ("+") or unchanged context (" ") line
+            lines_by_file[current_file][new_line] = line[1:]  # added ("+") or unchanged context (" ") line, prefix stripped
             new_line += 1
         # anything else — removed ("-") lines, "\ No newline" markers, the blank
         # separator fetch_pr_diff puts between files — isn't a line in the new file
 
     return lines_by_file
+
+
+def commentable_lines(diff: str) -> dict[str, set[int]]:
+    """
+    maps each file in the diff to the new-file line numbers github will accept comments on.
+    github rejects (422) inline comments on lines outside the diff hunks — and the LLM
+    sometimes invents line numbers — so findings are checked against this before posting.
+    """
+    return {path: set(lines) for path, lines in new_file_lines(diff).items()}
+
+
+def code_snippet(diff: str, file_path: str, line_number: int | None, context: int = 2) -> str | None:
+    """
+    the code a finding points at: its line plus `context` lines either side.
+    returns None if the line isn't in the diff (e.g. an LLM-invented line number).
+    """
+    lines = new_file_lines(diff).get(file_path, {})
+    if line_number not in lines:
+        return None
+    nearby = range(line_number - context, line_number + context + 1)
+    return "\n".join(lines[n] for n in nearby if n in lines)
+
+
+def diff_chunks(diff: str, chunk_size: int = 8) -> list[str]:
+    """
+    splits the new-file code in a diff into small chunks of consecutive lines.
+    the embedding model only reads ~256 tokens, so a whole diff can't be one query —
+    each chunk is searched separately against past findings' code.
+    """
+    chunks = []
+    for lines in new_file_lines(diff).values():
+        numbers = sorted(lines)
+        for start in range(0, len(numbers), chunk_size):
+            chunk = "\n".join(lines[n] for n in numbers[start:start + chunk_size])
+            if chunk.strip():
+                chunks.append(chunk)
+    return chunks
 
 
 def post_review(

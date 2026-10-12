@@ -1,12 +1,71 @@
 from backend.worker import celery_app
 from backend.database import AsyncSessionLocal
 from backend.models import PullRequest, Review
-from backend.github_client import fetch_pr_diff, post_review, get_latest_commit_sha, commentable_lines
+from backend.github_client import fetch_pr_diff, post_review, get_latest_commit_sha, commentable_lines, code_snippet, diff_chunks
+from backend.embeddings import embed, find_similar, to_bytes, from_bytes
 from sqlalchemy import select, delete
 from backend.agents import review_graph
 from backend.analytics import QualityRuleEvaluator
 from datetime import datetime
 import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
+
+# cap on how many past findings are loaded per review — bounds memory and search time
+MEMORY_SEARCH_LIMIT = 2000
+
+
+async def recall_similar_findings(db, pr, diff: str) -> list[dict]:
+    """
+    review memory lookup: finds past findings in the same repo whose code looks like
+    the code in this diff. memory is an optional extra — if anything here fails the
+    review still runs, just without hints.
+    """
+    try:
+        # only this repo's history — other repos' findings would be irrelevant (and could leak their code)
+        rows = await db.execute(
+            select(Review)
+            .join(PullRequest, Review.pr_id == PullRequest.id)
+            .where(
+                PullRequest.repo_name == pr.repo_name,
+                Review.pr_id != pr.id,
+                Review.embedding.is_not(None),
+            )
+            .order_by(Review.id.desc())
+            .limit(MEMORY_SEARCH_LIMIT)
+        )
+        past = [
+            {
+                "embedding": from_bytes(r.embedding),
+                "agent_type": r.agent_type,
+                "severity": r.severity,
+                "file_path": r.file_path,
+                "comment": r.comment,
+            }
+            for r in rows.scalars().all()
+        ]
+        return find_similar(diff_chunks(diff), past)
+    except Exception:
+        logger.exception("review memory lookup failed for PR %s — continuing without it", pr.id)
+        return []
+
+
+def embed_findings(findings, diff: str) -> list[tuple[str | None, bytes | None]]:
+    """
+    for each finding: the code it points at, and that code's embedding, so future
+    reviews can recall it. (None, None) when the line isn't in the diff; embeddings
+    are skipped (None) if the model fails, without failing the review.
+    """
+    snippets = [code_snippet(diff, f.file_path, f.line_number) for f in findings]
+    to_embed = [s for s in snippets if s]
+    try:
+        vectors = iter(embed(to_embed)) if to_embed else iter([])
+        return [(s, to_bytes(next(vectors)) if s else None) for s in snippets]
+    except Exception:
+        logger.exception("embedding findings failed — saving them without memory")
+        return [(s, None) for s in snippets]
+
 
 @celery_app.task(name="backend.tasks.review_pr", bind=True, max_retries=3)
 def review_pr(self, pr_id: int):
@@ -52,11 +111,13 @@ async def _review_pr_async(task, pr_id: int):
             # get latest commit SHA — needed to attach line comments to correct file version
             commit_sha = get_latest_commit_sha(pr.repo_name, pr.github_pr_number)
 
-            # run all 4 agents — each focuses on different aspect of code
-            # NEW — LangGraph parallel execution
+            # look up similar past findings in this repo — passed to the agents as hints
+            similar_findings = await recall_similar_findings(db, pr, diff)
 
+            # run all 4 agents in parallel with LangGraph — each focuses on different aspect of code
             result = review_graph.invoke({
                 "diff": diff,
+                "similar_findings": similar_findings,
                 "security_findings": [],
                 "bug_findings": [],
                 "quality_findings": [],
@@ -75,8 +136,8 @@ async def _review_pr_async(task, pr_id: int):
             # clear findings saved by a previous failed attempt so a retry replaces them instead of duplicating
             await db.execute(delete(Review).where(Review.pr_id == pr.id))
 
-            # save all findings to PostgreSQL
-            for finding in all_findings:
+            # save all findings to PostgreSQL, with the code + embedding that future reviews will search
+            for finding, (snippet, embedding) in zip(all_findings, embed_findings(all_findings, diff)):
                 db.add(Review(
                     pr_id=pr.id,
                     agent_type=finding.agent_type,
@@ -84,7 +145,9 @@ async def _review_pr_async(task, pr_id: int):
                     file_path=finding.file_path,
                     line_number=finding.line_number,
                     comment=finding.comment,
-                    suggested_fix=finding.suggested_fix
+                    suggested_fix=finding.suggested_fix,
+                    code_snippet=snippet,
+                    embedding=embedding
                 ))
             await db.commit()
 

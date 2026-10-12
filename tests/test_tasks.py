@@ -1,10 +1,11 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import numpy as np
 import pytest
 
 from backend.ai_client import ReviewFinding
-from backend.tasks import _review_pr_async
+from backend.tasks import _review_pr_async, embed_findings, recall_similar_findings
 
 DIFF = (
     "\n--- app.py ---\n"
@@ -13,6 +14,13 @@ DIFF = (
     "+line two\n"
     "+line three\n"
 )
+
+
+@pytest.fixture(autouse=True)
+def fake_embedding_model():
+    """keeps every task test from loading the real Hugging Face model"""
+    with patch("backend.tasks.embed", side_effect=lambda texts: np.ones((len(texts), 384), dtype="float32")) as mock:
+        yield mock
 
 
 def _finding(line_number, file_path="app.py") -> ReviewFinding:
@@ -132,6 +140,59 @@ async def test_failure_with_retries_left_is_marked_retrying(_diff, _sha, mock_gr
     assert pr.github_review_id is None
     db.rollback.assert_called_once()
     task.retry.assert_called_once()
+
+
+@pytest.mark.asyncio
+@patch("backend.tasks.post_review", return_value=555)
+@patch("backend.tasks.review_graph")
+@patch("backend.tasks.get_latest_commit_sha", return_value="sha123")
+@patch("backend.tasks.fetch_pr_diff", return_value=DIFF)
+@patch("backend.tasks.recall_similar_findings", new_callable=AsyncMock)
+async def test_similar_past_findings_are_passed_to_the_agents(mock_recall, _diff, _sha, mock_graph, _post):
+    hint = {"agent_type": "bug", "severity": "high", "file_path": "app.py", "comment": "off by one", "similarity": 0.6}
+    mock_recall.return_value = [hint]
+    mock_graph.invoke.return_value = {"all_findings": []}
+    pr = _pr()
+    session_factory, _ = _mock_session(pr)
+
+    with patch("backend.tasks.AsyncSessionLocal", session_factory):
+        await _review_pr_async(_mock_task(), pr.id)
+
+    assert mock_graph.invoke.call_args.args[0]["similar_findings"] == [hint]
+
+
+@pytest.mark.asyncio
+@patch("backend.tasks.post_review", return_value=555)
+@patch("backend.tasks.review_graph")
+@patch("backend.tasks.get_latest_commit_sha", return_value="sha123")
+@patch("backend.tasks.fetch_pr_diff", return_value=DIFF)
+async def test_findings_are_saved_with_code_snippet_and_embedding(_diff, _sha, mock_graph, _post):
+    mock_graph.invoke.return_value = {"all_findings": [_finding(2), _finding(500)]}
+    pr = _pr()
+    session_factory, db = _mock_session(pr)
+
+    with patch("backend.tasks.AsyncSessionLocal", session_factory):
+        await _review_pr_async(_mock_task(), pr.id)
+
+    saved = {r.line_number: r for r in (call.args[0] for call in db.add.call_args_list)}
+    assert saved[2].code_snippet == "line one\nline two\nline three"
+    assert len(saved[2].embedding) == 384 * 4
+    assert saved[500].code_snippet is None     # line not in the diff → nothing to remember
+    assert saved[500].embedding is None
+
+
+@pytest.mark.asyncio
+async def test_memory_lookup_failure_returns_no_hints_instead_of_failing():
+    db = MagicMock()
+    db.execute = AsyncMock(side_effect=Exception("db hiccup"))
+
+    assert await recall_similar_findings(db, _pr(), DIFF) == []
+
+
+def test_embedding_failure_saves_findings_without_embeddings(fake_embedding_model):
+    fake_embedding_model.side_effect = RuntimeError("model failed to load")
+
+    assert embed_findings([_finding(2)], DIFF) == [("line one\nline two\nline three", None)]
 
 
 @pytest.mark.asyncio

@@ -10,7 +10,7 @@ Responsibilities:
     - Define relationship between them
 """
 
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Index
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Index, LargeBinary
 from sqlalchemy.sql import func
 
 from backend.database import Base
@@ -63,4 +63,8 @@ class Review(Base):
     line_number = Column(Integer, nullable=True)
     comment = Column(Text, nullable=False)
     suggested_fix = Column(Text, nullable=True)
+    # review memory (embeddings.py): the code this finding pointed at + its 384-float
+    # embedding as raw bytes. null when the line wasn't in the diff or embedding failed
+    code_snippet = Column(Text, nullable=True)
+    embedding = Column(LargeBinary, nullable=True)
     created_at = Column(DateTime, server_default=func.now())

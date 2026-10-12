@@ -9,6 +9,7 @@ class AgentState(TypedDict):
     shared state passed between every node in the graph.
     """
     diff: str                                                            # PR code changes
+    similar_findings: List[dict]                                         # review memory hits (embeddings.py) — read-only input
     security_findings: Annotated[List[ReviewFinding], operator.add]     # security agent output
     bug_findings: Annotated[List[ReviewFinding], operator.add]          # bug agent output
     quality_findings: Annotated[List[ReviewFinding], operator.add]      # quality agent output
@@ -16,30 +17,43 @@ class AgentState(TypedDict):
     all_findings: Annotated[List[ReviewFinding], operator.add]          # synthesizer output
 
 
+def past_findings_for(state: AgentState, agent_type: str) -> str:
+    """
+    formats review-memory hits for one agent — each agent only sees past findings
+    from its own specialty, so the security agent isn't distracted by naming nits.
+    """
+    lines = [
+        f"- [{f['severity']}] {f['file_path']}: {f['comment']}"
+        for f in state.get("similar_findings", [])
+        if f["agent_type"] == agent_type
+    ]
+    return "\n".join(lines)
+
+
 def run_security_agent(state: AgentState) -> dict:
     """
     security node — reads diff, finds vulnerabilities.
     returns only security_findings — LangGraph merges into state automatically.
     """
-    review = analyze_pr(state["diff"], "security")
+    review = analyze_pr(state["diff"], "security", past_findings_for(state, "security"))
     return {"security_findings": review.findings}
 
 
 def run_bug_agent(state: AgentState) -> dict:
     """bug node — reads diff, finds logical errors and crashes"""
-    review = analyze_pr(state["diff"], "bug")
+    review = analyze_pr(state["diff"], "bug", past_findings_for(state, "bug"))
     return {"bug_findings": review.findings}
 
 
 def run_quality_agent(state: AgentState) -> dict:
     """quality node — reads diff, finds readability and style issues"""
-    review = analyze_pr(state["diff"], "quality")
+    review = analyze_pr(state["diff"], "quality", past_findings_for(state, "quality"))
     return {"quality_findings": review.findings}
 
 
 def run_optimization_agent(state: AgentState) -> dict:
     """optimization node — reads diff, finds performance issues"""
-    review = analyze_pr(state["diff"], "optimization")
+    review = analyze_pr(state["diff"], "optimization", past_findings_for(state, "optimization"))
     return {"optimization_findings": review.findings}
 
 

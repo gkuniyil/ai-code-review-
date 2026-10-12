@@ -44,13 +44,24 @@ AGENT_PROMPTS = {
 }
 
 
-def analyze_pr(diff: str, agent_type: str) -> PRReview:
+def analyze_pr(diff: str, agent_type: str, past_findings: str = "") -> PRReview:
     """
     sends PR diff to groq/llama and gets back structured review findings.
     agent_type tells the model which aspect of code to focus on.
+    past_findings: optional hints from review memory (embeddings.py) — issues this
+    repo had before in similar code.
     """
     # get right prompt for this agent type
     system_prompt = AGENT_PROMPTS[agent_type]
+
+    # framed as hints, not instructions: the model should only report what's actually in this diff
+    memory_section = ""
+    if past_findings:
+        memory_section = f"""
+Issues previously found in similar code in this repository. Use them only as hints for
+what to look for — report an issue only if it is actually present in the diff below.
+{past_findings}
+"""
 
     # call groq api — send diff + instructions, get back JSON findings
     response = client.chat.completions.create(
@@ -61,7 +72,7 @@ def analyze_pr(diff: str, agent_type: str) -> PRReview:
             {
                 "role": "user",
                 "content": f"""Analyze this PR diff and return JSON only. No other text.
-
+{memory_section}
 PR Diff:
 {diff}
 
