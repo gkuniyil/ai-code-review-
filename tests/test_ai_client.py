@@ -95,11 +95,16 @@ def test_groq_path_parses_and_validates_json():
         SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload)))
     ]
     with patch.object(ai_client.settings, "llm_provider", "groq"), \
+         patch.object(ai_client.settings, "groq_model", "openai/gpt-oss-120b"), \
          patch.object(ai_client, "_groq_client", return_value=groq):
         review = analyze_pr(DIFF, "security", "- hint")
 
+    kwargs = groq.chat.completions.create.call_args.kwargs
     assert review.findings[0].file_path == "app.py"
-    assert "- hint" in groq.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+    assert "- hint" in kwargs["messages"][1]["content"]
+    assert kwargs["model"] == "openai/gpt-oss-120b"
+    assert kwargs["response_format"] == {"type": "json_object"}
+    assert kwargs["max_tokens"] >= 4000     # reasoning models spend tokens before answering
 
 
 def test_groq_path_rejects_invalid_json():

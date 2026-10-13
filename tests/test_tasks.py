@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from backend.ai_client import ReviewFinding
-from backend.tasks import _review_pr_async, embed_findings, recall_similar_findings
+from backend.tasks import _review_pr_async, _run_review, embed_findings, recall_similar_findings
 
 DIFF = (
     "\n--- app.py ---\n"
@@ -20,6 +20,13 @@ DIFF = (
 def fake_embedding_model():
     """keeps every task test from loading the real Hugging Face model"""
     with patch("backend.tasks.embed", side_effect=lambda texts: np.ones((len(texts), 384), dtype="float32")) as mock:
+        yield mock
+
+
+@pytest.fixture(autouse=True)
+def no_review_on_github_yet():
+    """by default github has no review from an earlier attempt — and no test hits the real API"""
+    with patch("backend.tasks.find_posted_review", return_value=None) as mock:
         yield mock
 
 
@@ -193,6 +200,77 @@ def test_embedding_failure_saves_findings_without_embeddings(fake_embedding_mode
     fake_embedding_model.side_effect = RuntimeError("model failed to load")
 
     assert embed_findings([_finding(2)], DIFF) == [("line one\nline two\nline three", None)]
+
+
+@pytest.mark.asyncio
+@patch("backend.tasks.post_review")
+@patch("backend.tasks.review_graph")
+@patch("backend.tasks.fetch_pr_diff")
+async def test_review_already_on_github_is_not_posted_again(mock_diff, mock_graph, mock_post, no_review_on_github_yet):
+    """
+    Regression test (found in a live run): an attempt posted the review, then failed to
+    save its id (int32 overflow), so every retry posted another copy — 4 identical
+    reviews. Retries now find the earlier review on github by its hidden marker.
+    """
+    no_review_on_github_yet.return_value = 5498006500
+    pr = _pr(status="retrying")
+    session_factory, _ = _mock_session(pr)
+
+    with patch("backend.tasks.AsyncSessionLocal", session_factory):
+        await _review_pr_async(_mock_task(retries=1), pr.id)
+
+    no_review_on_github_yet.assert_called_once_with("octocat/hello-world", 42, "<!-- ai-code-reviewer run:99 -->")
+    mock_diff.assert_not_called()
+    mock_graph.invoke.assert_not_called()
+    mock_post.assert_not_called()
+    assert pr.github_review_id == 5498006500
+    assert pr.status == "completed"
+
+
+@pytest.mark.asyncio
+@patch("backend.tasks.post_review", return_value=555)
+@patch("backend.tasks.review_graph")
+@patch("backend.tasks.get_latest_commit_sha", return_value="sha123")
+@patch("backend.tasks.fetch_pr_diff", return_value=DIFF)
+async def test_posted_review_carries_the_run_marker(_diff, _sha, mock_graph, mock_post):
+    mock_graph.invoke.return_value = {"all_findings": []}
+    pr = _pr()
+    session_factory, _ = _mock_session(pr)
+
+    with patch("backend.tasks.AsyncSessionLocal", session_factory):
+        await _review_pr_async(_mock_task(), pr.id)
+
+    summary = mock_post.call_args.args[3]
+    assert summary.startswith("<!-- ai-code-reviewer run:99 -->")
+
+
+def test_review_id_column_holds_real_github_ids():
+    """github review ids are past 2^31 — a 32-bit column overflowed in a live run"""
+    from sqlalchemy import BigInteger
+    from backend.models import PullRequest
+
+    assert isinstance(PullRequest.__table__.c.github_review_id.type, BigInteger)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", [None, RuntimeError("review failed")])
+async def test_connection_pool_is_disposed_after_every_task(outcome):
+    """
+    Regression test (found in a live run): each task runs in a fresh asyncio.run() loop,
+    so pooled asyncpg connections from the previous task's loop broke every retry with
+    "attached to a different loop". The pool must be emptied when each task ends —
+    including when it fails and Celery is about to retry.
+    """
+    with patch("backend.tasks._review_pr_async", AsyncMock(side_effect=outcome)), \
+         patch("backend.tasks.engine") as engine:
+        engine.dispose = AsyncMock()
+        if outcome is None:
+            await _run_review(_mock_task(), 99)
+        else:
+            with pytest.raises(RuntimeError):
+                await _run_review(_mock_task(), 99)
+
+    engine.dispose.assert_awaited_once()
 
 
 @pytest.mark.asyncio

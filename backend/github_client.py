@@ -90,6 +90,27 @@ def diff_chunks(diff: str, chunk_size: int = 8) -> list[str]:
     return chunks
 
 
+def review_marker(run_id: int) -> str:
+    """hidden html comment identifying which review run posted a github review"""
+    return f"<!-- ai-code-reviewer run:{run_id} -->"
+
+
+def find_posted_review(repo_name: str, pr_number: int, marker: str) -> int | None:
+    """
+    returns the id of a review on the PR whose body contains marker, or None.
+    lets a retry detect that an earlier attempt already posted — even if that attempt
+    crashed before it could record the review id in our database.
+    """
+    try:
+        pr = github_client.get_repo(repo_name).get_pull(pr_number)
+        for review in pr.get_reviews():
+            if review.body and marker in review.body:
+                return review.id
+        return None
+    except GithubException as e:
+        raise Exception(f"failed to list reviews: {e.status} {e.data}")  # bubble up so celery retries
+
+
 def post_review(
     repo_name: str,
     pr_number: int,

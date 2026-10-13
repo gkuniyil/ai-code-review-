@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     # LLM provider for the review agents: "groq" (Llama 3.3, free tier) or "anthropic" (Claude)
     llm_provider: Literal["groq", "anthropic"] = "groq"
     groq_api_key: str | None = None
+    # llama-3.3-70b-versatile was the original model but groq no longer serves it (404 model_not_found)
+    groq_model: str = "openai/gpt-oss-120b"
     anthropic_api_key: str | None = None   # optional: the SDK also reads ANTHROPIC_API_KEY / `ant auth login`
     # REVIEW_ prefix on purpose: CLAUDE_EFFORT and ANTHROPIC_MODEL are already used by
     # other tools (e.g. Claude Code sets CLAUDE_EFFORT), and would silently override these

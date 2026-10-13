@@ -1,7 +1,10 @@
 from backend.worker import celery_app
-from backend.database import AsyncSessionLocal
+from backend.database import AsyncSessionLocal, engine
 from backend.models import PullRequest, Review
-from backend.github_client import fetch_pr_diff, post_review, get_latest_commit_sha, commentable_lines, code_snippet, diff_chunks
+from backend.github_client import (
+    fetch_pr_diff, post_review, get_latest_commit_sha, commentable_lines, code_snippet, diff_chunks,
+    find_posted_review, review_marker,
+)
 from backend.embeddings import MEMORY_SEARCH_LIMIT, embed, find_similar, to_bytes, from_bytes
 from sqlalchemy import select, delete
 from backend.agents import review_graph
@@ -67,7 +70,22 @@ def embed_findings(findings, diff: str) -> list[tuple[str | None, bytes | None]]
 @celery_app.task(name="backend.tasks.review_pr", bind=True, max_retries=3)
 def review_pr(self, pr_id: int):
     """main celery task — orchestrates full PR review pipeline"""
-    asyncio.run(_review_pr_async(self, pr_id))
+    asyncio.run(_run_review(self, pr_id))
+
+
+async def _run_review(task, pr_id: int):
+    """
+    asyncio.run() creates a new event loop for every task, but the engine's connection
+    pool is shared by the whole worker process. asyncpg connections belong to the loop
+    that opened them, so a pooled connection reused on the next task's loop fails
+    ("attached to a different loop" / "another operation is in progress") — which in
+    practice broke every retry. disposing the pool before this loop closes means each
+    task starts with fresh connections.
+    """
+    try:
+        await _review_pr_async(task, pr_id)
+    finally:
+        await engine.dispose()
 
 
 async def _review_pr_async(task, pr_id: int):
@@ -81,8 +99,14 @@ async def _review_pr_async(task, pr_id: int):
             if not pr:
                 raise Exception(f"PR {pr_id} not found in database")
 
-            # review was already posted by an earlier attempt (e.g. the worker crashed
-            # right after posting) — don't post it again, just finish marking it done
+            # review was already posted by an earlier attempt — don't post it again, just
+            # finish marking it done. checks our db first, then github itself: an attempt can
+            # post successfully and still fail before saving the id (seen in a live run, where
+            # that sent every retry back to post another copy)
+            if not pr.github_review_id:
+                pr.github_review_id = find_posted_review(
+                    pr.repo_name, pr.github_pr_number, review_marker(pr.id)
+                )
             if pr.github_review_id:
                 pr.status = "completed"
                 pr.completed_at = pr.completed_at or datetime.utcnow()
@@ -162,8 +186,9 @@ async def _review_pr_async(task, pr_id: int):
                 if finding.line_number in valid_lines.get(finding.file_path, set())
             ]
 
-            # build overall summary shown at the top of the review
-            summary = f"🤖 AI Code Review Complete\n\nFound {len(all_findings)} issues:\n"
+            # build overall summary shown at the top of the review. the hidden marker lets a
+            # later attempt find this review on github (see find_posted_review above)
+            summary = f"{review_marker(pr.id)}\n🤖 AI Code Review Complete\n\nFound {len(all_findings)} issues:\n"
             for finding in all_findings:
                 summary += f"- **{finding.severity.upper()}** ({finding.agent_type}): {finding.comment}\n"
 

@@ -10,7 +10,7 @@ Responsibilities:
     - Define relationship between them
 """
 
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Index, LargeBinary
+from sqlalchemy import BigInteger, Column, Integer, String, Text, DateTime, ForeignKey, Index, LargeBinary
 from sqlalchemy.sql import func
 
 from backend.database import Base
@@ -44,8 +44,9 @@ class PullRequest(Base):
     created_at = Column(DateTime, server_default=func.now())
     review_started_at = Column(DateTime, nullable = True)
     completed_at = Column(DateTime, nullable = True)
-    # set as soon as the github review is posted — a retry that sees this skips posting again
-    github_review_id = Column(Integer, nullable=True)
+    # set as soon as the github review is posted — a retry that sees this skips posting again.
+    # BigInteger: github review ids are already past the 32-bit limit (~2.1 billion)
+    github_review_id = Column(BigInteger, nullable=True)
 
 
 class Review(Base):

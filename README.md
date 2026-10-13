@@ -6,7 +6,7 @@ A full-stack platform that automatically reviews GitHub pull requests using AI t
 * Backend: FastAPI (Python)
 * Database: PostgreSQL (with SQLAlchemy, async)
 * Queue & Cache: Celery & Redis (for handling heavy background tasks)
-* AI Engine: 4 parallel review agents orchestrated via LangGraph, on a switchable provider — Groq (`llama-3.3-70b-versatile`, default) or Anthropic Claude (`claude-opus-5-5`)
+* AI Engine: 4 parallel review agents orchestrated via LangGraph, on a switchable provider — Groq (`openai/gpt-oss-120b` by default, set with `GROQ_MODEL`) or Anthropic Claude (`claude-opus-5-5`)
 * Review memory (RAG): Hugging Face `all-MiniLM-L6-v2` embeddings + FAISS similarity search
 
 ## Quick Setup
@@ -38,7 +38,7 @@ Once running, you can open your browser and go to http://localhost:8000/docs to 
 2. The request enqueues a Celery job on Redis and returns immediately — the FastAPI process never blocks on the AI review.
 3. A Celery worker fetches the PR diff via the GitHub API, runs it through 4 parallel Groq-backed review agents (security, bug, quality, optimization) orchestrated by a LangGraph graph, filters findings through a basic safety check (`QualityRuleEvaluator`), saves them to Postgres, and posts them back to the PR as **one GitHub review**: a summary plus inline comments. Findings whose line number isn't part of the diff (which GitHub would reject) appear in the summary only.
    * Every push to a PR is reviewed: `opened` and `synchronize` deliveries each create their own review run, deduplicated by GitHub's delivery id.
-   * Retries are safe: findings from a failed attempt are replaced rather than duplicated, and once the review is posted its id is stored (`github_review_id`), so a retry never posts it twice.
+   * Retries are safe: findings from a failed attempt are replaced rather than duplicated, and once the review is posted its id is stored (`github_review_id`), so a retry never posts it twice. Each review body also carries a hidden marker (`<!-- ai-code-reviewer run:<id> -->`); before posting, the worker checks GitHub for it, so even an attempt that posted but crashed before saving the id isn't re-posted.
    * **LLM provider is switchable** (`LLM_PROVIDER`): the rest of the app only calls `analyze_pr()` in `backend/ai_client.py`. On Claude, the response is constrained to the `PRReview` Pydantic schema with structured outputs (`messages.parse(output_format=PRReview)`), so it can't come back as invalid JSON the way free-form Groq output can. The system prompt and diff are identical for all four agents and come first in the request, marked for prompt caching, so retries (and later agents, once the cache is written) reuse them; agent-specific instructions follow. Policy refusals fall back to another model server-side (`fallbacks: "default"`), and a remaining refusal raises so Celery retries.
    * **Review memory (RAG):** each saved finding also stores the code it pointed at and an embedding of that code (`backend/embeddings.py`). Before the agents run, the new diff is split into small chunks and searched with FAISS against past findings **from the same repo**; matches above a similarity cutoff are added to the matching agent's prompt as hints (the security agent only sees past security findings, etc.).
      * Code is matched against *code*, not against finding text — in testing, code-vs-comment similarity was too noisy to rank correctly, while code-vs-code reliably surfaced related findings (~0.4–0.6) and ignored unrelated code (< 0.2).
@@ -81,19 +81,27 @@ Then register it with Claude Code by adding a `.mcp.json` in the repo root:
 ```
 The other settings (`GITHUB_TOKEN`, etc.) are still read from `.env` because `backend/config.py` requires them, even though the MCP server never uses them.
 
+## Live test
+Run end to end against a real private GitHub repo: a PR with five planted problems (hardcoded password, SQL injection, divide-by-zero on an empty list, an N+1 query, missing docstrings) was reviewed in ~12 s with Groq `openai/gpt-oss-120b`. All five were found by the expected agents, and all 10 inline comments landed on the correct lines. The run surfaced four bugs that unit tests with mocks had missed, all fixed with regression tests:
+* Groq had retired `llama-3.3-70b-versatile` (404 `model_not_found`).
+* `asyncio.run()` per task + a shared async connection pool broke every retry ("attached to a different loop"); the pool is now disposed when each task ends.
+* GitHub review ids exceed 32 bits, so saving `github_review_id` overflowed an `INTEGER` column *after* the review was posted, and each retry posted another copy (4 identical reviews). Now `BIGINT`, and posting is idempotent via the hidden marker.
+* `CLAUDE_EFFORT` collided with an environment variable set by Claude Code (caught while verifying the Claude request).
+
 ## Known limitations
+* Agents can overlap: the same line may be flagged by two agents (e.g. string-built SQL as both a security and a bug issue). Findings aren't deduplicated across agents yet.
 * The MCP server loads the full app `Settings`, so it needs the GitHub/Groq secrets in `.env` even though it never uses them. Giving it its own minimal settings would follow least privilege more closely.
 * Past findings recalled from memory are LLM-generated text derived from earlier PRs, so they're framed in the prompt as hints, not instructions — but like the diff itself they're untrusted input and a possible prompt-injection path.
 * No database migrations — tables are created with `create_all()`, which doesn't alter existing tables. A database created before the latest schema changes needs:
   ```sql
   ALTER TABLE pull_requests DROP CONSTRAINT IF EXISTS uq_repo_pr_number;
-  ALTER TABLE pull_requests ADD COLUMN IF NOT EXISTS github_review_id INTEGER;
+  ALTER TABLE pull_requests ADD COLUMN IF NOT EXISTS github_review_id BIGINT;
+  ALTER TABLE pull_requests ALTER COLUMN github_review_id TYPE BIGINT;
   ALTER TABLE reviews ADD COLUMN IF NOT EXISTS code_snippet TEXT;
   ALTER TABLE reviews ADD COLUMN IF NOT EXISTS embedding BYTEA;
   ```
   (or `docker compose down -v` to start from an empty database). Alembic would be the production fix.
 * If Redis is unreachable when a webhook arrives, the `PullRequest` row is saved but the job is never queued, so it stays `pending`. A transactional outbox (or a periodic sweep of stale `pending` rows) would fix this.
-* Each Celery task runs its async code with `asyncio.run()`, which creates a new event loop per task while the SQLAlchemy engine's connection pool is shared at module level. Pooled asyncpg connections are tied to the loop that created them, so this can fail on a worker's later tasks; disposing the engine per task (or using `NullPool` in the worker) would fix it.
 * `GET /metrics` and `GET /reviews/{pr_id}/score` are unauthenticated.
 * The four agents call the LLM at the same moment, so on Claude they usually all miss the prompt cache on the first attempt (the cache entry is written only once a response starts). Caching mainly pays off on retries; running one agent first to warm the cache would trade latency for cost.
-* Tests (67) cover the Groq and Claude providers (request shape, refusals, provider-specific config), webhook signature verification/dedup, the LangGraph agent fan-out/fan-in, GitHub API calls and diff-line parsing, the review task's retry/idempotency behavior, review memory (retrieval, thresholds, graceful failure — using a fake embedding model), the MCP server's tools and read-only annotations, its queries (against in-memory SQLite), and the safety filter. CI runs the MCP tests in a separate job with `requirements-mcp.txt` — they do not include a live integration test against real Postgres/Redis/GitHub.
+* Tests (74) cover the Groq and Claude providers (request shape, refusals, provider-specific config), webhook signature verification/dedup, the LangGraph agent fan-out/fan-in, GitHub API calls and diff-line parsing, the review task's retry/idempotency behavior, review memory (retrieval, thresholds, graceful failure — using a fake embedding model), the MCP server's tools and read-only annotations, its queries (against in-memory SQLite), and the safety filter. CI runs the MCP tests in a separate job with `requirements-mcp.txt` — they do not include an automated integration test against real Postgres/Redis/GitHub.

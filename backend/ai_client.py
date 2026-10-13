@@ -80,8 +80,10 @@ def _analyze_with_groq(diff: str, agent_type: str, past_findings: str) -> PRRevi
 
     # call groq api — send diff + instructions, get back JSON findings
     response = _groq_client().chat.completions.create(
-        model="llama-3.3-70b-versatile",  # free powerful model on groq
-        max_tokens=1000,
+        model=settings.groq_model,
+        # room for reasoning models (e.g. gpt-oss) whose thinking tokens count toward this limit
+        max_tokens=8000,
+        response_format={"type": "json_object"},  # groq's JSON mode — reply must be a JSON object
         messages=[
             {"role": "system", "content": system_prompt},  # sets agent role
             {

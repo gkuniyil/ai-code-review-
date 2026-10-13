@@ -109,6 +109,25 @@ def test_post_review_bubbles_up_errors_for_celery_retry(mock_client):
         gc.post_review("octocat/hello-world", 42, "sha", "summary", [])
 
 
+@patch("backend.github_client.github_client")
+def test_find_posted_review_matches_hidden_marker(mock_client):
+    other = MagicMock(id=1, body="LGTM")
+    empty = MagicMock(id=2, body=None)
+    ours = MagicMock(id=3, body="<!-- ai-code-reviewer run:7 -->\n🤖 AI Code Review Complete")
+    mock_client.get_repo.return_value.get_pull.return_value.get_reviews.return_value = [other, empty, ours]
+
+    assert gc.find_posted_review("octocat/hello-world", 42, gc.review_marker(7)) == 3
+    assert gc.find_posted_review("octocat/hello-world", 42, gc.review_marker(8)) is None
+
+
+@patch("backend.github_client.github_client")
+def test_find_posted_review_bubbles_up_errors_for_celery_retry(mock_client):
+    mock_client.get_repo.side_effect = GithubException(502, {"message": "bad gateway"}, {})
+
+    with pytest.raises(Exception, match="failed to list reviews"):
+        gc.find_posted_review("octocat/hello-world", 42, gc.review_marker(7))
+
+
 def test_commentable_lines_tracks_added_and_context_lines_per_file():
     diff = (
         "\n--- a.py ---\n"
